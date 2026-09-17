@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: planner-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: 8722847054:AAHF8cTMja_RZ8-tCBXj8W5OOeJgFrxx6vc
+        sync: false
