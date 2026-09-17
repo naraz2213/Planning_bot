@@ -5,7 +5,8 @@ import threading
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from flask import Flask
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -31,25 +32,24 @@ gemini_key = os.getenv("GEMINI_API_KEY")
 if not gemini_key:
     raise RuntimeError("GEMINI_API_KEY не задан в Environment")
 
-genai.configure(api_key=gemini_key)
-model = genai.GenerativeModel("gemini-2.0-flash")
+# Новый SDK google-genai
+client = genai.Client(api_key=gemini_key)
+MODEL_NAME = "gemini-2.5-flash"
 
 bot = Bot(token=token)
 dp = Dispatcher()
 
 # ============ ХРАНИЛИЩЕ (in-memory) ============
-# events[user_id] = [ {title, type, start_at, end_at, location}, ... ]
 events_store = defaultdict(list)
-# templates[user_id] = [ {weekday, title, time, location}, ... ]
 templates_store = defaultdict(list)
 
-# ============ LLM ПАРСИНГ ============
-PARSE_PROMPT = """Ты — ассистент-планировщик. Пользователь пишет свои задачи, пары, встречи в свободной форме.
+# ============ ПРОМПТЫ ============
+PARSE_PROMPT = """Ты — ассистент-планировщик. Пользователь пишет свои задачи, пары, встречи в свободной, разговорной форме.
 Разбери текст и верни JSON-массив событий.
 
 Формат каждого события:
 {{
-  "title": "название",
+  "title": "краткое название",
   "type": "pair" | "meeting" | "task" | "other",
   "start_at": "YYYY-MM-DDTHH:MM:SS" или null,
   "end_at": "YYYY-MM-DDTHH:MM:SS" или null,
@@ -60,15 +60,48 @@ PARSE_PROMPT = """Ты — ассистент-планировщик. Польз
 - Сегодня: {today} ({weekday}), текущее время: {now}
 - Если дата/день не указан — считай, что это сегодня (если время уже прошло — завтра)
 - "завтра", "послезавтра", "в пятницу" — преобразуй в конкретную дату
-- Если время НЕ указано — поставь start_at = null и выбери разумное время сам:
+- Пользователь может описывать последовательность дел: "сначала почта, потом математика, потом домой, в 16:00 к другу".
+  Разбей это на отдельные события. Если время начала не указано — выбери разумное время сам,
+  исходя из последовательности и длительности ("час там буду", "пара часа два").
+- Если время НЕ указано совсем — поставь start_at = null и выбери разумное время сам:
   * пары → с 9:00 до 15:00
   * встречи → 15:00-19:00
   * задачи → 19:00-21:00
   * распределяй по слотам, чтобы не было наложений
-- Если указана длительность — посчитай end_at. Если нет — 1.5 часа для пар, 1 час для остальных
-- Тип определи сам по контексту
+- Если указана длительность ("час", "два часа") — посчитай end_at
+- Если длительность не указана: пары — 1.5 часа, остальное — 1 час
+- Тип определи сам по контексту (математика/физика/программирование — это pair; почта/магазин — task; к другу — meeting)
 
 Верни ТОЛЬКО JSON-массив, без markdown, без пояснений."""
+
+
+TEMPLATE_PROMPT = """Ты парсишь шаблон учебной недели. Пользователь описывает пары по дням.
+Верни JSON-массив:
+[{{"weekday": 0-6, "title": "название", "time": "HH:MM", "location": null}}]
+weekday: 0=понедельник, 6=воскресенье.
+Только JSON, без пояснений."""
+
+
+# ============ LLM ============
+def _call_gemini_json(prompt: str) -> list:
+    """Синхронный вызов Gemini с гарантированным JSON-ответом."""
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.2,
+        ),
+    )
+    raw = response.text.strip()
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        # если модель вернула {"events": [...]} — достаём список
+        for key in ("events", "items", "result", "data"):
+            if key in data and isinstance(data[key], list):
+                return data[key]
+        return [data]
+    return data if isinstance(data, list) else []
 
 
 async def parse_with_llm(text: str) -> list:
@@ -79,32 +112,29 @@ async def parse_with_llm(text: str) -> list:
         weekday=weekdays[now.weekday()],
         now=now.strftime("%H:%M"),
     ) + "\n\nТекст пользователя:\n" + text
-
     try:
-        response = await asyncio.to_thread(model.generate_content, prompt)
-        raw = response.text.strip()
-        # убираем возможные markdown-обёртки
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            data = [data]
-        return data if isinstance(data, list) else []
+        return await asyncio.to_thread(_call_gemini_json, prompt)
     except Exception as e:
-        print(f"LLM parse error: {e}")
+        print(f"LLM parse error: {type(e).__name__}: {e}")
         return []
 
 
-# ============ ВЫВОД РАСПИСАНИЯ ============
+async def parse_template_with_llm(text: str) -> list:
+    try:
+        return await asyncio.to_thread(_call_gemini_json, TEMPLATE_PROMPT + "\n\n" + text)
+    except Exception as e:
+        print(f"Template parse error: {type(e).__name__}: {e}")
+        return []
+
+
+# ============ ВЫВОД ============
 TYPE_EMOJI = {"pair": "📚", "meeting": "🤝", "task": "✅", "other": "📌"}
 
 
 def format_events_for_day(user_id: int, date: datetime) -> str:
     lines = []
     day_events = []
+
     for ev in events_store[user_id]:
         if not ev.get("start_at"):
             continue
@@ -115,7 +145,6 @@ def format_events_for_day(user_id: int, date: datetime) -> str:
         if dt.date() == date.date():
             day_events.append((dt, ev))
 
-    # добавляем события из шаблона
     for t in templates_store[user_id]:
         if t.get("weekday") == date.weekday():
             day_events.append((None, {
@@ -137,10 +166,9 @@ def format_events_for_day(user_id: int, date: datetime) -> str:
         time_str = ""
         if dt:
             time_str = dt.strftime("%H:%M")
-        elif ev.get("start_at") and isinstance(ev["start_at"], str) and "T" in ev["start_at"]:
-            time_str = ev["start_at"].split("T")[1][:5]
         elif isinstance(ev.get("start_at"), str):
-            time_str = ev["start_at"]
+            s = ev["start_at"]
+            time_str = s.split("T")[1][:5] if "T" in s else s
 
         loc = f" — {ev['location']}" if ev.get("location") else ""
         mark = " 🔁" if ev.get("_from_template") else ""
@@ -167,7 +195,8 @@ def format_range(user_id: int, days: int) -> str:
 async def cmd_start(message: types.Message):
     await message.answer(
         "Привет! Я бот-планировщик.\n\n"
-        "📝 Напиши мне свои задачи/пары/встречи свободным текстом — я разберу и добавлю в расписание.\n\n"
+        "📝 Напиши мне свои задачи/пары/встречи свободным текстом — я разберу и добавлю в расписание.\n"
+        "Например: «завтра в 10 пара по матану, в 15 встреча с научруком, вечером доделать отчёт»\n\n"
         "Команды:\n"
         "/today — расписание на сегодня\n"
         "/week — на неделю\n"
@@ -179,14 +208,12 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("today"))
 async def cmd_today(message: types.Message):
-    text = format_range(message.from_user.id, 1)
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(format_range(message.from_user.id, 1), parse_mode="Markdown")
 
 
 @dp.message(Command("week"))
 async def cmd_week(message: types.Message):
-    text = format_range(message.from_user.id, 7)
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(format_range(message.from_user.id, 7), parse_mode="Markdown")
 
 
 @dp.message(Command("show_template"))
@@ -197,9 +224,10 @@ async def cmd_show_template(message: types.Message):
         return
     weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     lines = ["*Шаблон недели:*"]
-    for t in sorted(tpl, key=lambda x: (x["weekday"], x.get("time", ""))):
+    for t in sorted(tpl, key=lambda x: (x.get("weekday", 0), x.get("time", ""))):
         loc = f" — {t['location']}" if t.get("location") else ""
-        lines.append(f"{weekdays[t['weekday']]} {t.get('time', '')} {t['title']}{loc}")
+        wd = weekdays[t.get("weekday", 0)]
+        lines.append(f"{wd} {t.get('time', '')} {t['title']}{loc}")
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
@@ -222,13 +250,6 @@ async def cmd_clear(message: types.Message):
     await message.answer("Всё очищено.")
 
 
-TEMPLATE_PROMPT = """Ты парсишь шаблон учебной недели. Пользователь описывает пары по дням.
-Верни JSON-массив:
-[{{"weekday": 0-6, "title": "название", "time": "HH:MM", "location": null}}]
-weekday: 0=понедельник, 6=воскресенье.
-Только JSON, без пояснений."""
-
-
 @dp.message()
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
@@ -236,28 +257,22 @@ async def handle_text(message: types.Message):
     if not text:
         return
 
-    # Проверяем — это шаблон или обычное событие?
-    # Если в тексте есть названия дней недели в начале строк — считаем шаблоном
+    # Шаблон? (если в тексте ≥2 названий дней недели ИЛИ явные строки)
     weekdays_lower = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-    is_template = any(w in text.lower() for w in weekdays_lower) and text.count("\n") >= 1
+    wd_count = sum(1 for w in weekdays_lower if w in text.lower())
+    is_template = wd_count >= 2 or (wd_count >= 1 and text.count("\n") >= 1)
 
     if is_template:
-        try:
-            response = await asyncio.to_thread(model.generate_content, TEMPLATE_PROMPT + "\n\n" + text)
-            raw = response.text.strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            items = json.loads(raw.strip())
-            if isinstance(items, list):
-                templates_store[user_id] = items
-                await message.answer(f"Шаблон сохранён: {len(items)} пар. Проверь /show_template")
-                return
-        except Exception as e:
-            print(f"Template parse error: {e}")
+        await message.answer("⏳ Разбираю шаблон...")
+        items = await parse_template_with_llm(text)
+        if items:
+            templates_store[user_id] = items
+            await message.answer(f"✅ Шаблон сохранён: {len(items)} пар. Проверь /show_template")
+            return
+        await message.answer("Не смог разобрать шаблон. Попробуй ещё раз.")
+        return
 
-    # Обычное событие
+    # Обычные события
     await message.answer("⏳ Разбираю...")
     parsed = await parse_with_llm(text)
     if not parsed:
@@ -284,7 +299,7 @@ async def handle_text(message: types.Message):
 # ============ ЗАПУСК ============
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Bot starting...")
+    print(f"Bot starting, model={MODEL_NAME}")
     await dp.start_polling(bot)
 
 
